@@ -28,7 +28,7 @@ status: implementable
 
 ## Release Signoff Checklist
 
-- [ ] Enhancement is `implementable`
+- [x] Enhancement is `implementable`
 - [ ] Design details are appropriately documented from clear requirements
 - [ ] Test plan is defined
 - [ ] Graduation criteria for dev preview, tech preview, GA
@@ -53,23 +53,33 @@ interruption, is not acceptable.
 
 - Migrate the cluster network provider from OpenShift SDN to OVN Kubernetes for a 
   existing cluster.
+  - The OVN Kubernetes will be running in the multi-zone IC mode.
+- This solution shall work in all platforms managed by the SD team.
+  - ARO (Azure Red Hat OpenShift)
+  - OSDv4 (OpenShift Dedicated) on GCP
+  - OSDv4 (OpenShift Dedicated) on AWS
+  - ROSA Classic (Red Hat OpenShift Service on AWS)
 - This is in-place migration without requiring extra nodes.
 - The impact to workload of the migration shall be similar as an OCP upgrade.
-- The solution can work in scale, e.g. in a large cluster with hundreds of
-  nodes.
+- The solution can work in scale, e.g. in a large cluster with 100+ nodes.
 - The migration operation shall be able to be rolled back if needed.
 
 ### Non-Goals
 
 - Support for migration to other network providers
 - The necessary GUI change in Openshift Cluster Manager.
-- The live migration of the egress IP, router and firewall configuration.
-- Migration from SDN Multitenant mode
+- Ensure the following features remain working during live migration:
+  - Egress IP
+  - Egress Router
+  - Egress Firewall
+  - Multicast
+- Migration from SDN Multi-tenant mode
+- Migrate to OVN Kubernetes single-zone IC mode.
+- Support Hypershift clusters
 
 ## Pre-requisites
 
-- This solution relies on the ovnkube hybrid overlay feature. This bug 
-  https://bugzilla.redhat.com/show_bug.cgi?id=2040779 needs to be fixed.
+- OVN-IC multi-zone mode in OCP is dev-complete.
 
 ## Proposal
 
@@ -83,14 +93,12 @@ connect the networks owned by OpenShift SDN and OVN Kubernetes.
   connected.
 - During migration, CNO will take original-plugin nodes one by one and convert
   them to destination-plugin nodes, rebooting them in the process.
-- The cluster network CIDR will not change. In fact, none of the node host
-  subnets will change.
+- The cluster network CIDR will remain unchanged, so does the node host subnet
+  of each node.
 - NetworkPolicy will work correctly throughout the migration.
 
 ### Limitations
 
-- Multicast may not work during the migration when the CNI plugins are running
-  in parallel, but it shall work after the migration is complete.
 - The following features which are only supported by OpenShift SDN but not by
   OVN Kubernetes, will stop working when the migration is started.
   - Multitenant Isolation
@@ -105,9 +113,9 @@ connect the networks owned by OpenShift SDN and OVN Kubernetes.
   And we have support automated converting for the configuration. However, users
   shall not expect these feature can function as normal during the live
   migration phase.
+  - Multicast
   - Egress IP
   - Egress Firewall
-  - Multicast
 
 ### User Stories
 
@@ -133,34 +141,41 @@ windows nodes.
 
 In the SDN live migration use case, we can enhance this feature to connects the
 nodes managed by different CNI plugins. To minimize the implementation effort,
-and the code maintainability, we will try to reused the whole hybrid overlay and
-only make necessary changes to both CNI plugins.
+and the code maintainability, we will try to reused the hybrid overlay code and
+only make necessary changes to both CNI plugins. OVN Kubernetes nodes (OVN-IC
+zones) will have full-mesh connections to all OpenShift SDN Nodes through VXLAN
+tunnel.
 
 On the OVN Kubernetes side, all the cross CNI traffic shall follow the same path
 of current hybrid overlay implementation. For OVN Kubernetes, we need to do
 following enhancements:
 
-1. We need to modify OVN-K to allow overlapping between the cluster network and
-   the Hybrid overlay CIDR. So that we can reuse the cluster network in the
-   migration.
-2. We need to modify OVN-K to allow modifying the hybrid overlay CIDR on the
+1. We need to prevent OVN-K from allocating subnet for each host. We need to
+   reuse the host subnet allocated by OpenShift SDN.
+2. We need to modify OVN-K to allow overlapping between the cluster network and
+   the Hybrid overlay CIDR.
+3. We need to modify OVN-K to allow adding/removing hybrid overlay nodes on the
    fly.
-3. We need to allow `hybrid-overlay-node` running on the linux nodes using
+4. We need to allow `hybrid-overlay-node` running on the linux nodes using
    OpenShift SDN as CNI plugin, currently it is designed to only run on windows
-   nodes. 
+   nodes. It is responsible for: 
+   - collecting the MAC address of the host primary interface, and set the node
+     annotation `k8s.ovn.org/hybrid-overlay-distributed-router-gateway-mac`.
+   - removing the pod annotations added by OVN Kubernetes for pods running on
+     local node.
 
-On the OpenShift SDN side, when a node is converted to OVN Kubernetes,
-it shall be almost transparent to the control-plane. But we need to introduce a
-'migration mode' for OpenShift SDN by:
+On the OpenShift SDN side, when a node is converted to OVN Kubernetes, it shall
+be almost transparent to the control-plane of OpenShift SDN. But we still need
+to introduce a 'migration mode' for OpenShift SDN by:
 
 1. Change ingress NetworkPolicy processing to be based entirely on pod IPs
    rather than using namespace VNIDs, since packets from ovn nodes will have
    the VNID 0 set.
 2. To be compatible with Windows node VXLAN implementation, OVN-K hybrid overlay
-   uses the host interface MAC as VXLAN inner MAC. When packets arrive at the
-   br0 of the SDN node, they cannot be forwarded to the pod interface, due to
-   the MAC mismatch. We need to add flows for each pod which swaps the dst MAC
-   to the pod interface mac.
+   uses the peer host interface MAC as VXLAN inner dest MAC for egress traffic.
+   Therefore when packets arrive at the br0 of the SDN node, they cannot be
+   forwarded to the pod interface correctly. We need to add flows for each pod
+   to change the dst MAC to the pod interface MAC.
 
 ### The Traffic Path
 
@@ -275,6 +290,10 @@ Once migration is complete, CNO will:
 
 ### API
 
+A new field `spec.migration.isLive` will be introduced to the CRD
+`networks.operator.openshift.io`. Users can set this flag to conduct a live
+migration or a offline migration.
+
 To start the migration, users need to update the `network.operator`
 CR by adding:
 
@@ -323,7 +342,13 @@ This is a one-time operation for a cluster, therefore no lifecycle management.
 
 ### Test Plan
 
-TBD
+We need to setup a CI job which can run the sig-network test against a cluster
+that is in an intermediate state of live migration, specifically some nodes are
+running with OVN Kubernetes, and the rests are running with OpenShift SDN. So
+that we can ensure the cluster network remains functioning during the migration.
+
+We also need to work closely with the Performance & Scale test team and SD team
+to test the live migration on a large (100+ nodes) cluster.
 
 ### Graduation Criteria
 
